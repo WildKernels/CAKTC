@@ -25,6 +25,7 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git config fetch.output full
 
       - name: Mirror hardcoded kernel branches
         shell: bash
@@ -34,7 +35,8 @@ jobs:
           GH_REPO: ${{ github.repository }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          set -euo pipefail
+          set -Eeuo pipefail
+          set -x
           shopt -s extglob nullglob
 
           PATTERNS=(
@@ -57,19 +59,21 @@ jobs:
           git remote remove upstream 2>/dev/null || true
           git remote add upstream "$SOURCE_REPO"
 
-          echo "Scanning upstream branches from $SOURCE_REPO"
+          echo "::notice::Scanning upstream branches from $SOURCE_REPO"
           MATCHED_BRANCHES=()
 
           for pattern in "${PATTERNS[@]}"; do
-            echo "Checking pattern: $pattern"
+            echo "::group::Pattern $pattern"
             while IFS=$'\t' read -r sha ref; do
               [[ -z "${ref:-}" ]] && continue
               branch="${ref#refs/heads/}"
               if [[ -n "$BRANCH_FILTER" && "$branch" != $BRANCH_FILTER ]]; then
                 continue
               fi
+              echo "Matched ref $ref at $sha"
               MATCHED_BRANCHES+=("$branch")
             done < <(git ls-remote --branches "$SOURCE_REPO" "$pattern")
+            echo "::endgroup::"
           done
 
           if [[ ${#MATCHED_BRANCHES[@]} -eq 0 ]]; then
@@ -80,29 +84,22 @@ jobs:
           mapfile -t MATCHED_BRANCHES < <(printf '%s\n' "${MATCHED_BRANCHES[@]}" | sort -u)
 
           total=${#MATCHED_BRANCHES[@]}
-          echo "Found $total branch(es) to mirror"
+          echo "::notice::Found $total branch(es) to mirror"
           printf '%s\n' "${MATCHED_BRANCHES[@]}"
 
           done_count=0
           for branch in "${MATCHED_BRANCHES[@]}"; do
             done_count=$((done_count + 1))
-            echo ""
-            echo "============================================================"
-            echo "[$done_count/$total] START $branch"
-            echo "============================================================"
-            echo "Fetching $branch"
-            git fetch --no-tags upstream \
+            echo "::group::[$done_count/$total] $branch"
+            git fetch --verbose --progress --no-tags upstream \
               "+refs/heads/${branch}:refs/remotes/upstream/${branch}"
-            echo "Fetched $branch"
-            echo "Pushing $branch"
-            git push origin \
+            git push --verbose --progress origin \
               "refs/remotes/upstream/${branch}:refs/heads/${branch}" \
               --force
-            echo "Finished $branch [$done_count/$total]"
+            echo "::endgroup::"
           done
 
-          echo ""
-          echo "Checking for stale managed branches to delete"
+          echo "::notice::Checking for stale managed branches to delete"
           mapfile -t REMOTE_BRANCHES < <(
             git ls-remote --branches "https://x-access-token:${GH_TOKEN}@github.com/${GH_REPO}.git" \
               | awk '{print $2}' \
@@ -134,8 +131,7 @@ jobs:
 
             if [[ "$keep" == false ]]; then
               deleted_count=$((deleted_count + 1))
-              echo "Deleting stale mirrored branch: $remote_branch"
-              git push origin --delete "$remote_branch"
+              git push --verbose origin --delete "$remote_branch"
             fi
           done
 
