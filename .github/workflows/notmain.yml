@@ -1,0 +1,70 @@
+name: Kernel single branch test
+
+on:
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: Exact branch name to mirror, for example android14-6.1 or deprecated/android14-6.1-2024-01
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout this repo
+        uses: actions/checkout@v4
+
+      - name: Configure Git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git config fetch.output full
+
+      - name: Mirror one branch
+        shell: bash
+        env:
+          SOURCE_REPO: https://android.googlesource.com/kernel/common
+          BRANCH: ${{ inputs.branch }}
+        run: |
+          set -Eeuo pipefail
+          set -x
+
+          if [[ -z "$BRANCH" ]]; then
+            echo "Branch input is required."
+            exit 1
+          fi
+
+          git remote remove upstream 2>/dev/null || true
+          git remote add upstream "$SOURCE_REPO"
+
+          echo "Checking that branch exists upstream"
+          git ls-remote --branches "$SOURCE_REPO" "refs/heads/$BRANCH"
+
+          if [[ "$BRANCH" == deprecated/* ]]; then
+            echo "Deprecated branch detected, using depth=1"
+            git fetch --verbose --progress --depth=1 --no-tags upstream \
+              "+refs/heads/${BRANCH}:refs/remotes/upstream/${BRANCH}"
+          else
+            echo "Active branch detected, using normal full fetch"
+            git fetch --verbose --progress --no-tags upstream \
+              "+refs/heads/${BRANCH}:refs/remotes/upstream/${BRANCH}"
+          fi
+
+          git push --verbose --progress origin \
+            "refs/remotes/upstream/${BRANCH}:refs/heads/${BRANCH}" \
+            --force
+
+          {
+            echo "### Single branch mirror result"
+            echo ""
+            echo "Branch mirrored: $BRANCH"
+            if [[ "$BRANCH" == deprecated/* ]]; then
+              echo "Fetch mode: shallow depth 1"
+            else
+              echo "Fetch mode: full branch history"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
