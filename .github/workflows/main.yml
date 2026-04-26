@@ -1,11 +1,11 @@
-name: Kernel latest single commit only
+name: Kernel latest single commit all families
 
 'on':
   workflow_dispatch:
     inputs:
       branch_filter:
-        description: "Branch glob filter, for example android14-6.1*"
-        required: true
+        description: "Optional extra branch glob filter"
+        required: false
         default: ""
         type: string
 
@@ -25,7 +25,7 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git config gc.auto 0
 
-      - name: Mirror latest commit only
+      - name: Mirror latest commit for all requested branch families
         shell: bash
         env:
           SOURCE_REPO: https://android.googlesource.com/kernel/common
@@ -34,18 +34,40 @@ jobs:
           set -Eeuo pipefail
           set -x
 
+          PATTERNS=(
+            'refs/heads/android12-5.10*'
+            'refs/heads/android13-5.10*'
+            'refs/heads/android13-5.15*'
+            'refs/heads/android14-5.15*'
+            'refs/heads/android14-6.1*'
+            'refs/heads/android15-6.6*'
+            'refs/heads/android16-6.12*'
+            'refs/heads/deprecated/android12-5.10*'
+            'refs/heads/deprecated/android13-5.10*'
+            'refs/heads/deprecated/android13-5.15*'
+            'refs/heads/deprecated/android14-5.15*'
+            'refs/heads/deprecated/android14-6.1*'
+            'refs/heads/deprecated/android15-6.6*'
+            'refs/heads/deprecated/android16-6.12*'
+          )
+
           git remote remove upstream 2>/dev/null || true
           git remote add upstream "$SOURCE_REPO"
 
           MATCHED_BRANCHES=()
-          while IFS=$'\t' read -r sha ref; do
-            [[ -z "${ref:-}" ]] && continue
-            branch="${ref#refs/heads/}"
-            MATCHED_BRANCHES+=("$branch")
-          done < <(git ls-remote --branches "$SOURCE_REPO" "$BRANCH_FILTER")
+          for pattern in "${PATTERNS[@]}"; do
+            while IFS=$'\t' read -r sha ref; do
+              [[ -z "${ref:-}" ]] && continue
+              branch="${ref#refs/heads/}"
+              if [[ -n "$BRANCH_FILTER" && "$branch" != $BRANCH_FILTER ]]; then
+                continue
+              fi
+              MATCHED_BRANCHES+=("$branch")
+            done < <(git ls-remote --branches "$SOURCE_REPO" "$pattern")
+          done
 
           if [[ ${#MATCHED_BRANCHES[@]} -eq 0 ]]; then
-            echo "No branches matched filter: $BRANCH_FILTER"
+            echo "No branches matched."
             exit 1
           fi
 
@@ -80,7 +102,6 @@ jobs:
           {
             echo "### Latest single-commit mirror complete"
             echo ""
-            echo "Filter: $BRANCH_FILTER"
             echo "Branches processed: ${#MATCHED_BRANCHES[@]}"
             echo ""
             echo "Processed branches:"
