@@ -1,4 +1,4 @@
-name: Kernel branch mirror
+name: Kernel chunked history mirror
 
 on:
   workflow_dispatch:
@@ -8,8 +8,13 @@ on:
         required: false
         default: ''
         type: string
+      chunk_commits:
+        description: Number of commits per history chunk push
+        required: false
+        default: '250'
+        type: string
   schedule:
-    - cron: '17 6 * * *'
+    - cron: '31 6 * * *'
 
 permissions:
   contents: write
@@ -27,11 +32,12 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git config fetch.output full
 
-      - name: Mirror hardcoded kernel branches
+      - name: Chunked mirror hardcoded kernel branches
         shell: bash
         env:
           SOURCE_REPO: https://android.googlesource.com/kernel/common
           BRANCH_FILTER: ${{ inputs.branch_filter }}
+          CHUNK_COMMITS: ${{ inputs.chunk_commits }}
           GH_REPO: ${{ github.repository }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -56,12 +62,15 @@ jobs:
             'refs/heads/deprecated/android16-6.12*'
           )
 
+          if ! [[ "$CHUNK_COMMITS" =~ ^[0-9]+$ ]] || [[ "$CHUNK_COMMITS" -le 0 ]]; then
+            echo "chunk_commits must be a positive integer"
+            exit 1
+          fi
+
           git remote remove upstream 2>/dev/null || true
           git remote add upstream "$SOURCE_REPO"
 
-          echo "::notice::Scanning upstream branches from $SOURCE_REPO"
           MATCHED_BRANCHES=()
-
           for pattern in "${PATTERNS[@]}"; do
             echo "::group::Pattern $pattern"
             while IFS=$'\t' read -r sha ref; do
@@ -83,63 +92,63 @@ jobs:
 
           mapfile -t MATCHED_BRANCHES < <(printf '%s\n' "${MATCHED_BRANCHES[@]}" | sort -u)
 
-          total=${#MATCHED_BRANCHES[@]}
-          echo "::notice::Found $total branch(es) to mirror"
-          printf '%s\n' "${MATCHED_BRANCHES[@]}"
+          total_branches=${#MATCHED_BRANCHES[@]}
+          mirrored_count=0
 
-          done_count=0
           for branch in "${MATCHED_BRANCHES[@]}"; do
-            done_count=$((done_count + 1))
-            echo "::group::[$done_count/$total] $branch"
+            mirrored_count=$((mirrored_count + 1))
+            echo "::group::[$mirrored_count/$total_branches] Mirroring $branch"
+
             git fetch --verbose --progress --no-tags upstream \
               "+refs/heads/${branch}:refs/remotes/upstream/${branch}"
-            git push --verbose --progress origin \
-              "refs/remotes/upstream/${branch}:refs/heads/${branch}" \
-              --force
-            echo "::endgroup::"
-          done
 
-          echo "::notice::Checking for stale managed branches to delete"
-          mapfile -t REMOTE_BRANCHES < <(
-            git ls-remote --branches "https://x-access-token:${GH_TOKEN}@github.com/${GH_REPO}.git" \
-              | awk '{print $2}' \
-              | sed 's#refs/heads/##'
-          )
+            mapfile -t commits < <(git rev-list --reverse "refs/remotes/upstream/${branch}")
+            commit_count=${#commits[@]}
+            echo "Branch $branch has $commit_count commit(s)"
 
-          deleted_count=0
-          for remote_branch in "${REMOTE_BRANCHES[@]}"; do
-            managed=false
-            for pattern in "${PATTERNS[@]}"; do
-              shell_pattern="${pattern#refs/heads/}"
-              if [[ "$remote_branch" == $shell_pattern ]]; then
-                managed=true
-                break
-              fi
-            done
-
-            if [[ "$managed" == false ]]; then
+            if [[ "$commit_count" -eq 0 ]]; then
+              echo "No commits found for $branch"
+              echo "::endgroup::"
               continue
             fi
 
-            keep=false
-            for wanted in "${MATCHED_BRANCHES[@]}"; do
-              if [[ "$remote_branch" == "$wanted" ]]; then
-                keep=true
-                break
+            temp_branch="chunk-tmp-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+            git branch -D "$temp_branch" 2>/dev/null || true
+            git checkout --detach "${commits[0]}"
+            git branch "$temp_branch"
+
+            i=0
+            chunk_index=0
+            while [[ "$i" -lt "$commit_count" ]]; do
+              end=$((i + CHUNK_COMMITS - 1))
+              if [[ "$end" -ge "$commit_count" ]]; then
+                end=$((commit_count - 1))
               fi
+
+              chunk_index=$((chunk_index + 1))
+              target_commit="${commits[$end]}"
+              echo "Pushing chunk $chunk_index for $branch ending at $target_commit (commit index $((end + 1))/$commit_count)"
+
+              git update-ref "refs/heads/$temp_branch" "$target_commit"
+              git push --verbose --progress origin \
+                "+refs/heads/${temp_branch}:refs/heads/${branch}"
+
+              i=$((end + 1))
             done
 
-            if [[ "$keep" == false ]]; then
-              deleted_count=$((deleted_count + 1))
-              git push --verbose origin --delete "$remote_branch"
-            fi
+            echo "Final force push of exact upstream tip for $branch"
+            git push --verbose --progress origin \
+              "+refs/remotes/upstream/${branch}:refs/heads/${branch}"
+
+            git branch -D "$temp_branch" 2>/dev/null || true
+            echo "::endgroup::"
           done
 
           {
-            echo "### Mirror result"
+            echo "### Chunked mirror result"
             echo ""
-            echo "Mirrored branches: $total"
-            echo "Deleted stale managed branches: $deleted_count"
+            echo "Branches mirrored: $total_branches"
+            echo "Chunk size: $CHUNK_COMMITS commit(s)"
             echo ""
             echo "### Branches mirrored"
             for branch in "${MATCHED_BRANCHES[@]}"; do
