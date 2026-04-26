@@ -1,0 +1,144 @@
+name: Kernel branch mirror
+
+on:
+  workflow_dispatch:
+    inputs:
+      branch_filter:
+        description: Optional shell glob to limit mirrored branches, for example android14-6.1* or deprecated/android14-6.1*
+        required: false
+        default: ''
+        type: string
+  #schedule:
+  #  - cron: '17 6 * * *'
+
+permissions:
+  contents: write
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout this repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Configure Git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Mirror hardcoded kernel branches
+        shell: bash
+        env:
+          SOURCE_REPO: https://android.googlesource.com/kernel/common
+          BRANCH_FILTER: ${{ inputs.branch_filter }}
+          GH_REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          shopt -s extglob nullglob
+
+          PREFIXES=(
+            'android12-5.10*'
+            'android13-5.10*'
+            'android13-5.15*'
+            'android14-5.15*'
+            'android14-6.1*'
+            'android15-6.6*'
+            'android16-6.12*'
+            'deprecated/android12-5.10*'
+            'deprecated/android13-5.10*'
+            'deprecated/android13-5.15*'
+            'deprecated/android14-5.15*'
+            'deprecated/android14-6.1*'
+            'deprecated/android15-6.6*'
+            'deprecated/android16-6.12*'
+          )
+
+          git remote remove upstream 2>/dev/null || true
+          git remote add upstream "$SOURCE_REPO"
+
+          echo "Listing upstream branch refs"
+          mapfile -t ALL_BRANCHES < <(
+            git ls-remote --branches "$SOURCE_REPO" \
+              | awk '{print $2}' \
+              | sed 's#refs/heads/##' \
+              | sort -u
+          )
+
+          MATCHED_BRANCHES=()
+          for branch in "${ALL_BRANCHES[@]}"; do
+            for pattern in "${PREFIXES[@]}"; do
+              if [[ "$branch" == $pattern ]]; then
+                if [[ -n "$BRANCH_FILTER" && "$branch" != $BRANCH_FILTER ]]; then
+                  continue
+                fi
+                MATCHED_BRANCHES+=("$branch")
+                break
+              fi
+            done
+          done
+
+          if [[ ${#MATCHED_BRANCHES[@]} -eq 0 ]]; then
+            echo "No branches matched."
+            exit 1
+          fi
+
+          printf 'Matched branches:\n%s\n' "${MATCHED_BRANCHES[@]}"
+
+          for branch in "${MATCHED_BRANCHES[@]}"; do
+            echo "::group::Fetch $branch"
+            git fetch --no-tags upstream \
+              "+refs/heads/${branch}:refs/remotes/upstream/${branch}"
+            echo "::endgroup::"
+          done
+
+          for branch in "${MATCHED_BRANCHES[@]}"; do
+            echo "::group::Push $branch"
+            git push origin \
+              "refs/remotes/upstream/${branch}:refs/heads/${branch}" \
+              --force
+            echo "::endgroup::"
+          done
+
+          echo "Pruning previously mirrored managed branches not in current match set"
+          mapfile -t REMOTE_BRANCHES < <(
+            git ls-remote --branches "https://x-access-token:${GH_TOKEN}@github.com/${GH_REPO}.git" \
+              | awk '{print $2}' \
+              | sed 's#refs/heads/##'
+          )
+
+          for remote_branch in "${REMOTE_BRANCHES[@]}"; do
+            should_manage=false
+            for pattern in "${PREFIXES[@]}"; do
+              if [[ "$remote_branch" == $pattern ]]; then
+                should_manage=true
+                break
+              fi
+            done
+
+            if [[ "$should_manage" == false ]]; then
+              continue
+            fi
+
+            keep=false
+            for wanted in "${MATCHED_BRANCHES[@]}"; do
+              if [[ "$remote_branch" == "$wanted" ]]; then
+                keep=true
+                break
+              fi
+            done
+
+            if [[ "$keep" == false ]]; then
+              echo "Deleting stale mirrored branch $remote_branch"
+              git push origin --delete "$remote_branch"
+            fi
+          done
+
+          {
+            echo "### Mirrored branches"
+            for branch in "${MATCHED_BRANCHES[@]}"; do
+              echo "- $branch"
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
