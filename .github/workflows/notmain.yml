@@ -46,7 +46,7 @@ jobs:
 
           if [[ "$BRANCH" == deprecated/* ]]; then
             echo "Deprecated branch detected, using depth=1"
-            git fetch --verbose --progress --depth=1 --no-tags upstream \
+            git fetch --verbose --progress --no-tags upstream \
               "+refs/heads/${BRANCH}:refs/remotes/upstream/${BRANCH}"
           else
             echo "Active branch detected, using normal full fetch"
