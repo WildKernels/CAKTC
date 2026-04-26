@@ -1,15 +1,15 @@
-name: Kernel adaptive push all branches
+name: Kernel grow from first commit
 
 'on':
   workflow_dispatch:
     inputs:
       branch_filter:
-        description: "Optional shell glob to limit matched branches"
+        description: "Optional branch glob filter"
         required: false
         default: ""
         type: string
       target_gib:
-        description: "Target estimated size per push chunk in GiB"
+        description: "Estimated max GiB per push chunk"
         required: false
         default: "1.0"
         type: string
@@ -30,7 +30,7 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git config fetch.output full
 
-      - name: Adaptive size push
+      - name: Push branches in forward size-limited chunks
         shell: bash
         env:
           SOURCE_REPO: https://android.googlesource.com/kernel/common
@@ -83,18 +83,18 @@ jobs:
           mapfile -t MATCHED_BRANCHES < <(printf '%s\n' "${MATCHED_BRANCHES[@]}" | sort -u)
 
           estimate_pack_size() {
-            local old_ref="$1"
-            local new_ref="$2"
+            local base_ref="$1"
+            local tip_ref="$2"
             local tmpdir
             local outfile
 
             tmpdir="$(mktemp -d)"
             outfile="$tmpdir/pack"
 
-            if [[ -n "$old_ref" ]]; then
-              git rev-list --objects "$new_ref" "^$old_ref" | git pack-objects --stdout --revs "$outfile" >/dev/null 2>/dev/null || true
+            if [[ -n "$base_ref" ]]; then
+              git rev-list --objects "$tip_ref" "^$base_ref" | git pack-objects --stdout --revs "$outfile" >/dev/null 2>/dev/null || true
             else
-              git rev-list --objects "$new_ref" | git pack-objects --stdout --revs "$outfile" >/dev/null 2>/dev/null || true
+              git rev-list --objects "$tip_ref" | git pack-objects --stdout --revs "$outfile" >/dev/null 2>/dev/null || true
             fi
 
             local size=0
@@ -107,11 +107,11 @@ jobs:
           }
 
           total_branches=${#MATCHED_BRANCHES[@]}
-          current_branch_index=0
+          branch_index=0
 
           for branch in "${MATCHED_BRANCHES[@]}"; do
-            current_branch_index=$((current_branch_index + 1))
-            echo "::group::[$current_branch_index/$total_branches] Mirroring $branch"
+            branch_index=$((branch_index + 1))
+            echo "::group::[$branch_index/$total_branches] Mirroring $branch"
 
             git fetch --verbose --progress --no-tags upstream \
               "+refs/heads/${branch}:refs/remotes/upstream/${branch}"
@@ -125,68 +125,54 @@ jobs:
               continue
             fi
 
-            low=0
             remote_tip=""
-            step=1
+            chunk_start=0
+            i=0
 
-            while [[ "$low" -lt "$TOTAL" ]]; do
-              left=$low
-              right=$((TOTAL - 1))
-              best=-1
-              best_size=0
+            while [[ "$i" -lt "$TOTAL" ]]; do
+              current_commit="${COMMITS[$i]}"
+              size=$(estimate_pack_size "$remote_tip" "$current_commit")
+              gib=$(awk "BEGIN {printf \"%.3f\", ${size} / 1024 / 1024 / 1024}")
 
-              while [[ "$left" -le "$right" ]]; do
-                mid=$(((left + right) / 2))
-                candidate="${COMMITS[$mid]}"
-                size=$(estimate_pack_size "$remote_tip" "$candidate")
-                gib=$(awk "BEGIN {printf \"%.3f\", ${size} / 1024 / 1024 / 1024}")
+              echo "Branch $branch testing commit $((i + 1))/$TOTAL => $current_commit estimated ${gib} GiB"
 
-                echo "Branch $branch test step $step: commit $((mid + 1))/$TOTAL => ${candidate} estimated ${gib} GiB"
-
-                if [[ "$size" -gt 0 && "$size" -le "$TARGET_BYTES" ]]; then
-                  best=$mid
-                  best_size=$size
-                  left=$((mid + 1))
-                else
-                  right=$((mid - 1))
-                fi
-              done
-
-              if [[ "$best" -lt "$low" ]]; then
-                best=$low
-                best_commit="${COMMITS[$best]}"
-                best_size=$(estimate_pack_size "$remote_tip" "$best_commit")
-                gib=$(awk "BEGIN {printf \"%.3f\", ${best_size} / 1024 / 1024 / 1024}")
-                echo "Branch $branch no chunk under target found, forcing single-commit advance at ${best_commit} estimated ${gib} GiB"
+              if [[ "$size" -gt 0 && "$size" -le "$TARGET_BYTES" ]]; then
+                i=$((i + 1))
+                continue
               fi
 
-              best_commit="${COMMITS[$best]}"
-              best_gib=$(awk "BEGIN {printf \"%.3f\", ${best_size} / 1024 / 1024 / 1024}")
-              echo "Branch $branch pushing through commit $((best + 1))/$TOTAL => ${best_commit} estimated ${best_gib} GiB"
+              if [[ "$i" -eq "$chunk_start" ]]; then
+                echo "Single commit already exceeds target, forcing push of ${COMMITS[$i]}"
+                git push --verbose --progress origin \
+                  "+${COMMITS[$i]}:refs/heads/${branch}"
+                remote_tip="${COMMITS[$i]}"
+                i=$((i + 1))
+                chunk_start=$i
+                continue
+              fi
 
+              last_good_index=$((i - 1))
+              last_good_commit="${COMMITS[$last_good_index]}"
+              last_good_size=$(estimate_pack_size "$remote_tip" "$last_good_commit")
+              last_good_gib=$(awk "BEGIN {printf \"%.3f\", ${last_good_size} / 1024 / 1024 / 1024}")
+
+              echo "Branch $branch pushing chunk ending at commit $((last_good_index + 1))/$TOTAL => $last_good_commit estimated ${last_good_gib} GiB"
               git push --verbose --progress origin \
-                "+${best_commit}:refs/heads/${branch}"
+                "+${last_good_commit}:refs/heads/${branch}"
 
-              remote_tip="$best_commit"
-              low=$((best + 1))
-              step=$((step + 1))
+              remote_tip="$last_good_commit"
+              chunk_start=$i
             done
 
-            echo "Branch $branch final exact tip push"
-            git push --verbose --progress origin \
-              "+refs/remotes/upstream/${branch}:refs/heads/${branch}"
+            if [[ "$chunk_start" -lt "$TOTAL" ]]; then
+              final_commit="${COMMITS[$((TOTAL - 1))]}"
+              final_size=$(estimate_pack_size "$remote_tip" "$final_commit")
+              final_gib=$(awk "BEGIN {printf \"%.3f\", ${final_size} / 1024 / 1024 / 1024}")
+
+              echo "Branch $branch pushing final chunk => $final_commit estimated ${final_gib} GiB"
+              git push --verbose --progress origin \
+                "+${final_commit}:refs/heads/${branch}"
+            fi
 
             echo "::endgroup::"
           done
-
-          {
-            echo "### Adaptive push result"
-            echo ""
-            echo "Matched branches: ${#MATCHED_BRANCHES[@]}"
-            echo "Target size per push: $TARGET_GIB GiB"
-            echo ""
-            echo "### Branches processed"
-            for branch in "${MATCHED_BRANCHES[@]}"; do
-              echo "- $branch"
-            done
-          } >> "$GITHUB_STEP_SUMMARY"
