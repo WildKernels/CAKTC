@@ -42,11 +42,7 @@ jobs:
             'refs/heads/android14-6.1*'
           # Prepare README.md to store latest commit hashes
           README_FILE=README.md
-          # Remove old section if present (portable, no '|| true')
-          # Remove old section and append new table using a here-document for safety
-          TMP_README=$(mktemp)
-          awk '/^## Latest branch tips/ {exit} {print}' "$README_FILE" > "$TMP_README"
-          mv "$TMP_README" "$README_FILE"
+          # Only append, do not remove or overwrite any section
           echo -e '\n## Latest branch tips\n' >> "$README_FILE"
           echo '| Branch | Latest Commit |' >> "$README_FILE"
           echo '|--------|--------------|' >> "$README_FILE"
