@@ -1,41 +1,21 @@
-name: Kernel grow from first commit
+name: Kernel latest single commit only
 
 'on':
   workflow_dispatch:
     inputs:
       branch_filter:
-        description: "Optional branch glob filter"
-        required: false
+        description: "Branch glob filter, for example android14-6.1*"
+        required: true
         default: ""
-        type: string
-      target_gib:
-        description: "Estimated max GiB per push chunk"
-        required: false
-        default: "1.0"
         type: string
 
 permissions:
   contents: write
 
 jobs:
-  mirror:
+  mirror_latest_tip:
     runs-on: ubuntu-latest
     steps:
-      - name: Free Disk Space
-        if: true
-        uses: endersonmenezes/free-disk-space@v3  # Use @main for latest, @v3 for stable
-        with:
-            remove_android: true
-            remove_dotnet: true
-            remove_haskell: true
-            remove_tool_cache: true
-            remove_packages: "azure-cli google-cloud-cli microsoft-edge-stable google-chrome-stable firefox postgresql* temurin-* *llvm* mysql* dotnet-sdk-*"
-            remove_packages_one_command: true
-            remove_folders: "/usr/share/swift /usr/share/miniconda /usr/share/az* /usr/local/lib/node_modules /usr/local/share/chromium /usr/local/share/powershell /usr/local/julia /usr/local/aws-cli /usr/local/aws-sam-cli /usr/share/gradle"
-            rm_cmd: "rmz"  # Use 'rmz' for faster deletion (default: 'rm')
-            rmz_version: "3.1.1"  # Required when rm_cmd is 'rmz'
-            testing: false
-        
       - name: Checkout this repo
         uses: actions/checkout@v4
 
@@ -43,151 +23,68 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git config fetch.output full
+          git config gc.auto 0
 
-      - name: Push branches in forward size-limited chunks
+      - name: Mirror latest commit only
         shell: bash
         env:
           SOURCE_REPO: https://android.googlesource.com/kernel/common
           BRANCH_FILTER: ${{ inputs.branch_filter }}
-          TARGET_GIB: ${{ inputs.target_gib }}
         run: |
           set -Eeuo pipefail
           set -x
-          shopt -s extglob nullglob
-
-          TARGET_BYTES=$(awk "BEGIN {printf \"%.0f\", ${TARGET_GIB} * 1024 * 1024 * 1024}")
-
-          PATTERNS=(
-            'refs/heads/android12-5.10*'
-            'refs/heads/android13-5.10*'
-            'refs/heads/android13-5.15*'
-            'refs/heads/android14-5.15*'
-            'refs/heads/android14-6.1*'
-            'refs/heads/android15-6.6*'
-            'refs/heads/android16-6.12*'
-            'refs/heads/deprecated/android12-5.10*'
-            'refs/heads/deprecated/android13-5.10*'
-            'refs/heads/deprecated/android13-5.15*'
-            'refs/heads/deprecated/android14-5.15*'
-            'refs/heads/deprecated/android14-6.1*'
-            'refs/heads/deprecated/android15-6.6*'
-            'refs/heads/deprecated/android16-6.12*'
-          )
 
           git remote remove upstream 2>/dev/null || true
           git remote add upstream "$SOURCE_REPO"
 
           MATCHED_BRANCHES=()
-          for pattern in "${PATTERNS[@]}"; do
-            while IFS=$'\t' read -r sha ref; do
-              [[ -z "${ref:-}" ]] && continue
-              branch="${ref#refs/heads/}"
-              if [[ -n "$BRANCH_FILTER" && "$branch" != $BRANCH_FILTER ]]; then
-                continue
-              fi
-              MATCHED_BRANCHES+=("$branch")
-            done < <(git ls-remote --branches "$SOURCE_REPO" "$pattern")
-          done
+          while IFS=$'\t' read -r sha ref; do
+            [[ -z "${ref:-}" ]] && continue
+            branch="${ref#refs/heads/}"
+            MATCHED_BRANCHES+=("$branch")
+          done < <(git ls-remote --branches "$SOURCE_REPO" "$BRANCH_FILTER")
 
           if [[ ${#MATCHED_BRANCHES[@]} -eq 0 ]]; then
-            echo "No branches matched."
+            echo "No branches matched filter: $BRANCH_FILTER"
             exit 1
           fi
 
           mapfile -t MATCHED_BRANCHES < <(printf '%s\n' "${MATCHED_BRANCHES[@]}" | sort -u)
 
-          estimate_pack_size() {
-            local base_ref="$1"
-            local tip_ref="$2"
-            local tmpdir
-            local outfile
-
-            tmpdir="$(mktemp -d)"
-            outfile="$tmpdir/pack"
-
-            if [[ -n "$base_ref" ]]; then
-              git rev-list --objects "$tip_ref" "^$base_ref" | git pack-objects --stdout --revs "$outfile" >/dev/null 2>/dev/null || true
-            else
-              git rev-list --objects "$tip_ref" | git pack-objects --stdout --revs "$outfile" >/dev/null 2>/dev/null || true
-            fi
-
-            local size=0
-            if compgen -G "${outfile}-*.pack" > /dev/null; then
-              size=$(du -cb "${outfile}"-*.pack | tail -n1 | awk '{print $1}')
-            fi
-
-            rm -rf "$tmpdir"
-            echo "$size"
-          }
-
-          total_branches=${#MATCHED_BRANCHES[@]}
-          branch_index=0
+          echo "Matched ${#MATCHED_BRANCHES[@]} branches"
 
           for branch in "${MATCHED_BRANCHES[@]}"; do
-            branch_index=$((branch_index + 1))
-            echo "::group::[$branch_index/$total_branches] Mirroring $branch"
+            echo "::group::Processing $branch"
 
-            git fetch --verbose --progress --no-tags upstream \
-              "+refs/heads/${branch}:refs/remotes/upstream/${branch}"
+            git update-ref -d "refs/remotes/upstream/$branch" 2>/dev/null || true
 
-            mapfile -t COMMITS < <(git rev-list --reverse "refs/remotes/upstream/${branch}")
-            TOTAL=${#COMMITS[@]}
+            git fetch --depth=1 --no-tags upstream \
+              "+refs/heads/$branch:refs/remotes/upstream/$branch"
 
-            if [[ "$TOTAL" -eq 0 ]]; then
-              echo "No commits found for branch $branch"
-              echo "::endgroup::"
-              continue
-            fi
+            tip_sha=$(git rev-parse "refs/remotes/upstream/$branch")
+            fetched_count=$(git rev-list --count "refs/remotes/upstream/$branch" || echo 0)
 
-            remote_tip=""
-            chunk_start=0
-            i=0
+            echo "Fetched $fetched_count commit(s) from $branch"
+            echo "Pushing tip $tip_sha to origin/$branch"
 
-            while [[ "$i" -lt "$TOTAL" ]]; do
-              current_commit="${COMMITS[$i]}"
-              size=$(estimate_pack_size "$remote_tip" "$current_commit")
-              gib=$(awk "BEGIN {printf \"%.3f\", ${size} / 1024 / 1024 / 1024}")
+            git push --force origin \
+              "$tip_sha:refs/heads/$branch"
 
-              echo "Branch $branch testing commit $((i + 1))/$TOTAL => $current_commit estimated ${gib} GiB"
-
-              if [[ "$size" -gt 0 && "$size" -le "$TARGET_BYTES" ]]; then
-                i=$((i + 1))
-                continue
-              fi
-
-              if [[ "$i" -eq "$chunk_start" ]]; then
-                echo "Single commit already exceeds target, forcing push of ${COMMITS[$i]}"
-                git push --verbose --progress origin \
-                  "+${COMMITS[$i]}:refs/heads/${branch}"
-                remote_tip="${COMMITS[$i]}"
-                i=$((i + 1))
-                chunk_start=$i
-                continue
-              fi
-
-              last_good_index=$((i - 1))
-              last_good_commit="${COMMITS[$last_good_index]}"
-              last_good_size=$(estimate_pack_size "$remote_tip" "$last_good_commit")
-              last_good_gib=$(awk "BEGIN {printf \"%.3f\", ${last_good_size} / 1024 / 1024 / 1024}")
-
-              echo "Branch $branch pushing chunk ending at commit $((last_good_index + 1))/$TOTAL => $last_good_commit estimated ${last_good_gib} GiB"
-              git push --verbose --progress origin \
-                "+${last_good_commit}:refs/heads/${branch}"
-
-              remote_tip="$last_good_commit"
-              chunk_start=$i
-            done
-
-            if [[ "$chunk_start" -lt "$TOTAL" ]]; then
-              final_commit="${COMMITS[$((TOTAL - 1))]}"
-              final_size=$(estimate_pack_size "$remote_tip" "$final_commit")
-              final_gib=$(awk "BEGIN {printf \"%.3f\", ${final_size} / 1024 / 1024 / 1024}")
-
-              echo "Branch $branch pushing final chunk => $final_commit estimated ${final_gib} GiB"
-              git push --verbose --progress origin \
-                "+${final_commit}:refs/heads/${branch}"
-            fi
+            git update-ref -d "refs/remotes/upstream/$branch" 2>/dev/null || true
+            git reflog expire --expire=now --all || true
+            git gc --prune=now || true
 
             echo "::endgroup::"
           done
+
+          {
+            echo "### Latest single-commit mirror complete"
+            echo ""
+            echo "Filter: $BRANCH_FILTER"
+            echo "Branches processed: ${#MATCHED_BRANCHES[@]}"
+            echo ""
+            echo "Processed branches:"
+            for branch in "${MATCHED_BRANCHES[@]}"; do
+              echo "- $branch"
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
