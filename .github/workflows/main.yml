@@ -1,20 +1,18 @@
-name: Kernel chunked history mirror
+name: Kernel adaptive push all branches
 
-on:
+'on':
   workflow_dispatch:
     inputs:
       branch_filter:
-        description: Optional shell glob to limit mirrored branches, for example android14-6.1* or deprecated/android14-6.1*
+        description: "Optional shell glob to limit matched branches"
         required: false
-        default: ''
+        default: ""
         type: string
-      chunk_commits:
-        description: Number of commits per history chunk push
+      target_gib:
+        description: "Target estimated size per push chunk in GiB"
         required: false
-        default: '250'
+        default: "1.0"
         type: string
-  schedule:
-    - cron: '31 6 * * *'
 
 permissions:
   contents: write
@@ -32,18 +30,18 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git config fetch.output full
 
-      - name: Chunked mirror hardcoded kernel branches
+      - name: Adaptive size push
         shell: bash
         env:
           SOURCE_REPO: https://android.googlesource.com/kernel/common
           BRANCH_FILTER: ${{ inputs.branch_filter }}
-          CHUNK_COMMITS: ${{ inputs.chunk_commits }}
-          GH_REPO: ${{ github.repository }}
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TARGET_GIB: ${{ inputs.target_gib }}
         run: |
           set -Eeuo pipefail
           set -x
           shopt -s extglob nullglob
+
+          TARGET_BYTES=$(awk "BEGIN {printf \"%.0f\", ${TARGET_GIB} * 1024 * 1024 * 1024}")
 
           PATTERNS=(
             'refs/heads/android12-5.10*'
@@ -62,27 +60,19 @@ jobs:
             'refs/heads/deprecated/android16-6.12*'
           )
 
-          if ! [[ "$CHUNK_COMMITS" =~ ^[0-9]+$ ]] || [[ "$CHUNK_COMMITS" -le 0 ]]; then
-            echo "chunk_commits must be a positive integer"
-            exit 1
-          fi
-
           git remote remove upstream 2>/dev/null || true
           git remote add upstream "$SOURCE_REPO"
 
           MATCHED_BRANCHES=()
           for pattern in "${PATTERNS[@]}"; do
-            echo "::group::Pattern $pattern"
             while IFS=$'\t' read -r sha ref; do
               [[ -z "${ref:-}" ]] && continue
               branch="${ref#refs/heads/}"
               if [[ -n "$BRANCH_FILTER" && "$branch" != $BRANCH_FILTER ]]; then
                 continue
               fi
-              echo "Matched ref $ref at $sha"
               MATCHED_BRANCHES+=("$branch")
             done < <(git ls-remote --branches "$SOURCE_REPO" "$pattern")
-            echo "::endgroup::"
           done
 
           if [[ ${#MATCHED_BRANCHES[@]} -eq 0 ]]; then
@@ -92,65 +82,110 @@ jobs:
 
           mapfile -t MATCHED_BRANCHES < <(printf '%s\n' "${MATCHED_BRANCHES[@]}" | sort -u)
 
+          estimate_pack_size() {
+            local old_ref="$1"
+            local new_ref="$2"
+            local tmpdir
+            local outfile
+
+            tmpdir="$(mktemp -d)"
+            outfile="$tmpdir/pack"
+
+            if [[ -n "$old_ref" ]]; then
+              git rev-list --objects "$new_ref" "^$old_ref" | git pack-objects --stdout --revs "$outfile" >/dev/null 2>/dev/null || true
+            else
+              git rev-list --objects "$new_ref" | git pack-objects --stdout --revs "$outfile" >/dev/null 2>/dev/null || true
+            fi
+
+            local size=0
+            if compgen -G "${outfile}-*.pack" > /dev/null; then
+              size=$(du -cb "${outfile}"-*.pack | tail -n1 | awk '{print $1}')
+            fi
+
+            rm -rf "$tmpdir"
+            echo "$size"
+          }
+
           total_branches=${#MATCHED_BRANCHES[@]}
-          mirrored_count=0
+          current_branch_index=0
 
           for branch in "${MATCHED_BRANCHES[@]}"; do
-            mirrored_count=$((mirrored_count + 1))
-            echo "::group::[$mirrored_count/$total_branches] Mirroring $branch"
+            current_branch_index=$((current_branch_index + 1))
+            echo "::group::[$current_branch_index/$total_branches] Mirroring $branch"
 
             git fetch --verbose --progress --no-tags upstream \
               "+refs/heads/${branch}:refs/remotes/upstream/${branch}"
 
-            mapfile -t commits < <(git rev-list --reverse "refs/remotes/upstream/${branch}")
-            commit_count=${#commits[@]}
-            echo "Branch $branch has $commit_count commit(s)"
+            mapfile -t COMMITS < <(git rev-list --reverse "refs/remotes/upstream/${branch}")
+            TOTAL=${#COMMITS[@]}
 
-            if [[ "$commit_count" -eq 0 ]]; then
-              echo "No commits found for $branch"
+            if [[ "$TOTAL" -eq 0 ]]; then
+              echo "No commits found for branch $branch"
               echo "::endgroup::"
               continue
             fi
 
-            temp_branch="chunk-tmp-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-            git branch -D "$temp_branch" 2>/dev/null || true
-            git checkout --detach "${commits[0]}"
-            git branch "$temp_branch"
+            low=0
+            remote_tip=""
+            step=1
 
-            i=0
-            chunk_index=0
-            while [[ "$i" -lt "$commit_count" ]]; do
-              end=$((i + CHUNK_COMMITS - 1))
-              if [[ "$end" -ge "$commit_count" ]]; then
-                end=$((commit_count - 1))
+            while [[ "$low" -lt "$TOTAL" ]]; do
+              left=$low
+              right=$((TOTAL - 1))
+              best=-1
+              best_size=0
+
+              while [[ "$left" -le "$right" ]]; do
+                mid=$(((left + right) / 2))
+                candidate="${COMMITS[$mid]}"
+                size=$(estimate_pack_size "$remote_tip" "$candidate")
+                gib=$(awk "BEGIN {printf \"%.3f\", ${size} / 1024 / 1024 / 1024}")
+
+                echo "Branch $branch test step $step: commit $((mid + 1))/$TOTAL => ${candidate} estimated ${gib} GiB"
+
+                if [[ "$size" -gt 0 && "$size" -le "$TARGET_BYTES" ]]; then
+                  best=$mid
+                  best_size=$size
+                  left=$((mid + 1))
+                else
+                  right=$((mid - 1))
+                fi
+              done
+
+              if [[ "$best" -lt "$low" ]]; then
+                best=$low
+                best_commit="${COMMITS[$best]}"
+                best_size=$(estimate_pack_size "$remote_tip" "$best_commit")
+                gib=$(awk "BEGIN {printf \"%.3f\", ${best_size} / 1024 / 1024 / 1024}")
+                echo "Branch $branch no chunk under target found, forcing single-commit advance at ${best_commit} estimated ${gib} GiB"
               fi
 
-              chunk_index=$((chunk_index + 1))
-              target_commit="${commits[$end]}"
-              echo "Pushing chunk $chunk_index for $branch ending at $target_commit (commit index $((end + 1))/$commit_count)"
+              best_commit="${COMMITS[$best]}"
+              best_gib=$(awk "BEGIN {printf \"%.3f\", ${best_size} / 1024 / 1024 / 1024}")
+              echo "Branch $branch pushing through commit $((best + 1))/$TOTAL => ${best_commit} estimated ${best_gib} GiB"
 
-              git update-ref "refs/heads/$temp_branch" "$target_commit"
               git push --verbose --progress origin \
-                "+refs/heads/${temp_branch}:refs/heads/${branch}"
+                "+${best_commit}:refs/heads/${branch}"
 
-              i=$((end + 1))
+              remote_tip="$best_commit"
+              low=$((best + 1))
+              step=$((step + 1))
             done
 
-            echo "Final force push of exact upstream tip for $branch"
+            echo "Branch $branch final exact tip push"
             git push --verbose --progress origin \
               "+refs/remotes/upstream/${branch}:refs/heads/${branch}"
 
-            git branch -D "$temp_branch" 2>/dev/null || true
             echo "::endgroup::"
           done
 
           {
-            echo "### Chunked mirror result"
+            echo "### Adaptive push result"
             echo ""
-            echo "Branches mirrored: $total_branches"
-            echo "Chunk size: $CHUNK_COMMITS commit(s)"
+            echo "Matched branches: ${#MATCHED_BRANCHES[@]}"
+            echo "Target size per push: $TARGET_GIB GiB"
             echo ""
-            echo "### Branches mirrored"
+            echo "### Branches processed"
             for branch in "${MATCHED_BRANCHES[@]}"; do
               echo "- $branch"
             done
