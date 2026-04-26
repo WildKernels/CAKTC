@@ -213,12 +213,14 @@ jobs:
 
                           # Update README.md with latest branch tips as a markdown table
                           README_FILE=README.md
+                          # Ensure README.md exists
+                          if [ ! -f "$README_FILE" ]; then touch "$README_FILE"; fi
                           TMP_README=$(mktemp)
-                          awk '/^## Latest branch tips/ {exit} {print}' "$README_FILE" > "$TMP_README"
+                          awk '/^## Latest branch tips/ {exit} {print}' "$README_FILE" > "$TMP_README" 2>/dev/null
                           mv "$TMP_README" "$README_FILE"
-                          echo -e '\n## Latest branch tips\n' >> "$README_FILE"
-                          echo '| Branch | Latest Commit |' >> "$README_FILE"
-                          echo '|--------|--------------|' >> "$README_FILE"
+                          printf '\n## Latest branch tips\n\n' >> "$README_FILE"
+                          printf '| Branch | Latest Commit |\n' >> "$README_FILE"
+                          printf '|--------|--------------|\n' >> "$README_FILE"
 
                           for branch in "${MATCHED_BRANCHES[@]}"; do
                             echo "::group::Processing $branch"
