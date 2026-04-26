@@ -89,12 +89,13 @@ jobs:
             echo "Fetched $fetched_count commit(s) from $branch"
             echo "Pushing tip $tip_sha to origin/$branch"
 
-            git push --force origin \
-              "$tip_sha:refs/heads/$branch"
+            if ! git push --force origin "$tip_sha:refs/heads/$branch"; then
+              echo "::warning::Failed to push $branch, skipping to next branch."
+            fi
 
             git update-ref -d "refs/remotes/upstream/$branch" 2>/dev/null || true
             git reflog expire --expire=now --all || true
-            git gc --prune=now || true
+            git gc --prune=now --all || true
 
             echo "::endgroup::"
           done
