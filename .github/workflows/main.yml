@@ -43,9 +43,7 @@ jobs:
           # Prepare README.md to store latest commit hashes
           README_FILE=README.md
           # Remove old section if present (portable, no '|| true')
-          if grep -q '^## Latest branch tips' "$README_FILE"; then
-            awk '/^## Latest branch tips/ {p=1; print; next} /^## / && p {p=0} !p' "$README_FILE" > "$README_FILE.tmp" && mv "$README_FILE.tmp" "$README_FILE"
-          fi
+          if grep -q '^## Latest branch tips' "$README_FILE"; then awk '/^## Latest branch tips/ {p=1; print; next} /^## / && p {p=0} !p' "$README_FILE" > "$README_FILE.tmp" && mv "$README_FILE.tmp" "$README_FILE"; fi
           echo -e '\n## Latest branch tips\n' >> "$README_FILE"
           echo '| Branch | Latest Commit |' >> "$README_FILE"
           echo '|--------|--------------|' >> "$README_FILE"
