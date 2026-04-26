@@ -72,11 +72,28 @@ jobs:
           fi
 
 
-          # Print all matched branches for debugging
-          printf 'Matched branches (raw):\n'; printf '%s\n' "${MATCHED_BRANCHES[@]}"
+          # Deduplicate: if both deprecated/branch and branch exist, keep only deprecated/branch
+          declare -A branch_map
+          for b in "${MATCHED_BRANCHES[@]}"; do
+            if [[ "$b" == deprecated/* ]]; then
+              # Always prefer deprecated version
+              base_name="${b#deprecated/}"
+              branch_map["$base_name"]="$b"
+            else
+              # Only add non-deprecated if no deprecated version exists
+              if [[ -z "${branch_map["$b"]}" ]]; then
+                branch_map["$b"]="$b"
+              fi
+            fi
+          done
+          MATCHED_BRANCHES=()
+          for v in "${branch_map[@]}"; do
+            MATCHED_BRANCHES+=("$v")
+          done
+          # Sort for consistent order
           mapfile -t MATCHED_BRANCHES < <(printf '%s\n' "${MATCHED_BRANCHES[@]}" | sort -u)
-          echo "Matched ${#MATCHED_BRANCHES[@]} branches (unique):"
-          printf '%s\n' "${MATCHED_BRANCHES[@]}"
+          # Print all matched branches for debugging
+          printf 'Matched branches (deduped):\n'; printf '%s\n' "${MATCHED_BRANCHES[@]}"
 
           for branch in "${MATCHED_BRANCHES[@]}"; do
             echo "::group::Processing $branch"
