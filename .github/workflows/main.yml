@@ -87,9 +87,15 @@ jobs:
             fetched_count=$(git rev-list --count "refs/remotes/upstream/$branch" || echo 0)
 
             echo "Fetched $fetched_count commit(s) from $branch"
-            echo "Pushing tip $tip_sha to origin/$branch"
+            echo "Creating orphan commit for $branch"
 
-            if ! git push --force origin "$tip_sha:refs/heads/$branch"; then
+            # Get the tree of the latest commit
+            tree_sha=$(git show -s --format=%T "$tip_sha")
+            commit_msg="Mirror of $branch: $(git show -s --format=%s $tip_sha)"
+            new_commit=$(echo "$commit_msg" | git commit-tree "$tree_sha")
+
+            echo "Pushing orphan commit $new_commit to origin/$branch"
+            if ! git push --force origin "$new_commit:refs/heads/$branch"; then
               echo "::warning::Failed to push $branch, skipping to next branch."
             fi
 
