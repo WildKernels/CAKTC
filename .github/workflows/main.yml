@@ -8,8 +8,8 @@ on:
         required: false
         default: ''
         type: string
-  #schedule:
-  #  - cron: '17 6 * * *'
+  schedule:
+    - cron: '17 6 * * *'
 
 permissions:
   contents: write
@@ -20,8 +20,6 @@ jobs:
     steps:
       - name: Checkout this repo
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
 
       - name: Configure Git
         run: |
@@ -39,45 +37,39 @@ jobs:
           set -euo pipefail
           shopt -s extglob nullglob
 
-          PREFIXES=(
-            'android12-5.10*'
-            'android13-5.10*'
-            'android13-5.15*'
-            'android14-5.15*'
-            'android14-6.1*'
-            'android15-6.6*'
-            'android16-6.12*'
-            'deprecated/android12-5.10*'
-            'deprecated/android13-5.10*'
-            'deprecated/android13-5.15*'
-            'deprecated/android14-5.15*'
-            'deprecated/android14-6.1*'
-            'deprecated/android15-6.6*'
-            'deprecated/android16-6.12*'
+          PATTERNS=(
+            'refs/heads/android12-5.10*'
+            'refs/heads/android13-5.10*'
+            'refs/heads/android13-5.15*'
+            'refs/heads/android14-5.15*'
+            'refs/heads/android14-6.1*'
+            'refs/heads/android15-6.6*'
+            'refs/heads/android16-6.12*'
+            'refs/heads/deprecated/android12-5.10*'
+            'refs/heads/deprecated/android13-5.10*'
+            'refs/heads/deprecated/android13-5.15*'
+            'refs/heads/deprecated/android14-5.15*'
+            'refs/heads/deprecated/android14-6.1*'
+            'refs/heads/deprecated/android15-6.6*'
+            'refs/heads/deprecated/android16-6.12*'
           )
 
           git remote remove upstream 2>/dev/null || true
           git remote add upstream "$SOURCE_REPO"
 
-          echo "Listing upstream branch refs"
-          mapfile -t ALL_BRANCHES < <(
-            git ls-remote --branches "$SOURCE_REPO" \
-              | awk '{print $2}' \
-              | sed 's#refs/heads/##' \
-              | sort -u
-          )
-
+          echo "Scanning upstream branches from $SOURCE_REPO"
           MATCHED_BRANCHES=()
-          for branch in "${ALL_BRANCHES[@]}"; do
-            for pattern in "${PREFIXES[@]}"; do
-              if [[ "$branch" == $pattern ]]; then
-                if [[ -n "$BRANCH_FILTER" && "$branch" != $BRANCH_FILTER ]]; then
-                  continue
-                fi
-                MATCHED_BRANCHES+=("$branch")
-                break
+
+          for pattern in "${PATTERNS[@]}"; do
+            echo "Checking pattern: $pattern"
+            while IFS=$'\t' read -r sha ref; do
+              [[ -z "${ref:-}" ]] && continue
+              branch="${ref#refs/heads/}"
+              if [[ -n "$BRANCH_FILTER" && "$branch" != $BRANCH_FILTER ]]; then
+                continue
               fi
-            done
+              MATCHED_BRANCHES+=("$branch")
+            done < <(git ls-remote --branches "$SOURCE_REPO" "$pattern")
           done
 
           if [[ ${#MATCHED_BRANCHES[@]} -eq 0 ]]; then
@@ -85,40 +77,50 @@ jobs:
             exit 1
           fi
 
-          printf 'Matched branches:\n%s\n' "${MATCHED_BRANCHES[@]}"
+          mapfile -t MATCHED_BRANCHES < <(printf '%s\n' "${MATCHED_BRANCHES[@]}" | sort -u)
 
+          total=${#MATCHED_BRANCHES[@]}
+          echo "Found $total branch(es) to mirror"
+          printf '%s\n' "${MATCHED_BRANCHES[@]}"
+
+          done_count=0
           for branch in "${MATCHED_BRANCHES[@]}"; do
-            echo "::group::Fetch $branch"
+            done_count=$((done_count + 1))
+            echo ""
+            echo "============================================================"
+            echo "[$done_count/$total] START $branch"
+            echo "============================================================"
+            echo "Fetching $branch"
             git fetch --no-tags upstream \
               "+refs/heads/${branch}:refs/remotes/upstream/${branch}"
-            echo "::endgroup::"
-          done
-
-          for branch in "${MATCHED_BRANCHES[@]}"; do
-            echo "::group::Push $branch"
+            echo "Fetched $branch"
+            echo "Pushing $branch"
             git push origin \
               "refs/remotes/upstream/${branch}:refs/heads/${branch}" \
               --force
-            echo "::endgroup::"
+            echo "Finished $branch [$done_count/$total]"
           done
 
-          echo "Pruning previously mirrored managed branches not in current match set"
+          echo ""
+          echo "Checking for stale managed branches to delete"
           mapfile -t REMOTE_BRANCHES < <(
             git ls-remote --branches "https://x-access-token:${GH_TOKEN}@github.com/${GH_REPO}.git" \
               | awk '{print $2}' \
               | sed 's#refs/heads/##'
           )
 
+          deleted_count=0
           for remote_branch in "${REMOTE_BRANCHES[@]}"; do
-            should_manage=false
-            for pattern in "${PREFIXES[@]}"; do
-              if [[ "$remote_branch" == $pattern ]]; then
-                should_manage=true
+            managed=false
+            for pattern in "${PATTERNS[@]}"; do
+              shell_pattern="${pattern#refs/heads/}"
+              if [[ "$remote_branch" == $shell_pattern ]]; then
+                managed=true
                 break
               fi
             done
 
-            if [[ "$should_manage" == false ]]; then
+            if [[ "$managed" == false ]]; then
               continue
             fi
 
@@ -131,13 +133,19 @@ jobs:
             done
 
             if [[ "$keep" == false ]]; then
-              echo "Deleting stale mirrored branch $remote_branch"
+              deleted_count=$((deleted_count + 1))
+              echo "Deleting stale mirrored branch: $remote_branch"
               git push origin --delete "$remote_branch"
             fi
           done
 
           {
-            echo "### Mirrored branches"
+            echo "### Mirror result"
+            echo ""
+            echo "Mirrored branches: $total"
+            echo "Deleted stale managed branches: $deleted_count"
+            echo ""
+            echo "### Branches mirrored"
             for branch in "${MATCHED_BRANCHES[@]}"; do
               echo "- $branch"
             done
