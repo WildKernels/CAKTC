@@ -216,8 +216,9 @@ jobs:
                           # Ensure README.md exists
                           if [ ! -f "$README_FILE" ]; then touch "$README_FILE"; fi
                           TMP_README=$(mktemp)
-                          awk '/^## Latest branch tips/ {exit} {print}' "$README_FILE" > "$TMP_README" 2>/dev/null
-                          mv "$TMP_README" "$README_FILE"
+                          awk '/^## Latest branch tips/ {exit} {print}' "$README_FILE" 2>/dev/null > "$TMP_README"
+                          cat "$TMP_README" > "$README_FILE"
+                          rm -f "$TMP_README"
                           printf '\n## Latest branch tips\n\n' >> "$README_FILE"
                           printf '| Branch | Latest Commit |\n' >> "$README_FILE"
                           printf '|--------|--------------|\n' >> "$README_FILE"
