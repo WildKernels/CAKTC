@@ -71,12 +71,16 @@ jobs:
             exit 1
           fi
 
-          mapfile -t MATCHED_BRANCHES < <(printf '%s\n' "${MATCHED_BRANCHES[@]}" | sort -u)
 
-          echo "Matched ${#MATCHED_BRANCHES[@]} branches"
+          # Print all matched branches for debugging
+          printf 'Matched branches (raw):\n'; printf '%s\n' "${MATCHED_BRANCHES[@]}"
+          mapfile -t MATCHED_BRANCHES < <(printf '%s\n' "${MATCHED_BRANCHES[@]}" | sort -u)
+          echo "Matched ${#MATCHED_BRANCHES[@]} branches (unique):"
+          printf '%s\n' "${MATCHED_BRANCHES[@]}"
 
           for branch in "${MATCHED_BRANCHES[@]}"; do
             echo "::group::Processing $branch"
+            echo "DEBUG: About to process and push branch: '$branch'"
 
             git update-ref -d "refs/remotes/upstream/$branch" 2>/dev/null || true
 
