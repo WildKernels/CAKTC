@@ -119,33 +119,129 @@ jobs:
             tip_sha=$(git rev-parse "refs/remotes/upstream/$branch")
             fetched_count=$(git rev-list --count "refs/remotes/upstream/$branch" || echo 0)
 
-            echo "Fetched $fetched_count commit(s) from $branch"
-            echo "Creating orphan commit for $branch"
+            mirror_latest_tip:
+              runs-on: ubuntu-latest
+              steps:
+                - name: Checkout this repo
+                  uses: actions/checkout@v4
 
-            # Get the tree of the latest commit
-            tree_sha=$(git show -s --format=%T "$tip_sha")
-            commit_msg="Mirror of $branch: $(git show -s --format=%s $tip_sha)"
-            new_commit=$(echo "$commit_msg" | git commit-tree "$tree_sha")
+                - name: Configure Git
+                  run: |
+                    git config user.name "github-actions[bot]"
+                    git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+                    git config gc.auto 0
 
-            echo "Pushing orphan commit $new_commit to origin/$branch"
-            if ! git push --force origin "$new_commit:refs/heads/$branch"; then
-              echo "::warning::Failed to push $branch, skipping to next branch."
-            fi
+                - name: Mirror latest commit for all requested branch families
+                  env:
+                    SOURCE_REPO: https://android.googlesource.com/kernel/common
+                    BRANCH_FILTER: ${{ inputs.branch_filter }}
+                  shell: bash
+                  run: |
+                    set -Eeuo pipefail
+                    PATTERNS=(
+                      'refs/heads/android12-5.10*'
+                      'refs/heads/android13-5.10*'
+                      'refs/heads/android13-5.15*'
+                      'refs/heads/android14-5.15*'
+                      'refs/heads/android14-6.1*'
+                      'refs/heads/android15-6.6*'
+                      'refs/heads/android16-6.12*'
+                      'refs/heads/deprecated/android12-5.10*'
+                      'refs/heads/deprecated/android13-5.10*'
+                      'refs/heads/deprecated/android13-5.15*'
+                      'refs/heads/deprecated/android14-5.15*'
+                      'refs/heads/deprecated/android14-6.1*'
+                      'refs/heads/deprecated/android15-6.6*'
+                      'refs/heads/deprecated/android16-6.12*'
+                    )
 
-            git update-ref -d "refs/remotes/upstream/$branch" 2>/dev/null || true
-            git reflog expire --expire=now --all || true
-            git gc --prune=now --all || true
+                    git remote remove upstream 2>/dev/null || true
+                    git remote add upstream "$SOURCE_REPO"
 
-            echo "::endgroup::"
-          done
+                    MATCHED_BRANCHES=()
+                    for pattern in "${PATTERNS[@]}"; do
+                      while IFS=$'\t' read -r sha ref; do
+                        [[ -z "${ref:-}" ]] && continue
+                        branch="${ref#refs/heads/}"
+                        if [[ -n "$BRANCH_FILTER" && "$branch" != $BRANCH_FILTER ]]; then
+                          continue
+                        fi
+                        MATCHED_BRANCHES+=("$branch")
+                      done < <(git ls-remote --branches "$SOURCE_REPO" "$pattern")
+                    done
 
-          {
-            echo "### Latest single-commit mirror complete"
-            echo ""
-            echo "Branches processed: ${#MATCHED_BRANCHES[@]}"
-            echo ""
-            echo "Processed branches:"
-            for branch in "${MATCHED_BRANCHES[@]}"; do
-              echo "- $branch"
-            done
-          } >> "$GITHUB_STEP_SUMMARY"
+                    if [[ ${#MATCHED_BRANCHES[@]} -eq 0 ]]; then
+                      echo "No branches matched."
+                      exit 1
+                    fi
+
+                    # Deduplicate: if both deprecated/branch and branch exist, keep only deprecated/branch
+                    declare -A branch_map
+                    for b in "${MATCHED_BRANCHES[@]}"; do
+                      if [[ "$b" == deprecated/* ]]; then
+                        base_name="${b#deprecated/}"
+                        branch_map["$base_name"]="$b"
+                      else
+                        if [[ -z "${branch_map[$b]+_}" ]]; then
+                          branch_map["$b"]="$b"
+                        fi
+                      fi
+                    done
+                    MATCHED_BRANCHES=()
+                    for v in "${branch_map[@]}"; do
+                      MATCHED_BRANCHES+=("$v")
+                    done
+                    mapfile -t MATCHED_BRANCHES < <(printf '%s\n' "${MATCHED_BRANCHES[@]}" | sort -u)
+                    printf 'Matched branches (deduped):\n'; printf '%s\n' "${MATCHED_BRANCHES[@]}"
+
+                    # Update README.md with latest branch tips as a markdown table
+                    README_FILE=README.md
+                    TMP_README=$(mktemp)
+                    awk '/^## Latest branch tips/ {exit} {print}' "$README_FILE" > "$TMP_README"
+                    mv "$TMP_README" "$README_FILE"
+                    echo -e '\n## Latest branch tips\n' >> "$README_FILE"
+                    echo '| Branch | Latest Commit |' >> "$README_FILE"
+                    echo '|--------|--------------|' >> "$README_FILE"
+
+                    for branch in "${MATCHED_BRANCHES[@]}"; do
+                      echo "::group::Processing $branch"
+                      echo "DEBUG: About to process and push branch: '$branch'"
+
+                      git update-ref -d "refs/remotes/upstream/$branch" 2>/dev/null || true
+
+                      git fetch --depth=1 --no-tags upstream \
+                        "+refs/heads/$branch:refs/remotes/upstream/$branch"
+
+                      tip_sha=$(git rev-parse "refs/remotes/upstream/$branch")
+                      fetched_count=$(git rev-list --count "refs/remotes/upstream/$branch" || echo 0)
+
+                      echo "Fetched $fetched_count commit(s) from $branch"
+                      echo "Creating orphan commit for $branch"
+
+                      tree_sha=$(git show -s --format=%T "$tip_sha")
+                      commit_msg="Mirror of $branch: $(git show -s --format=%s $tip_sha)"
+                      new_commit=$(echo "$commit_msg" | git commit-tree "$tree_sha")
+
+                      echo "Pushing orphan commit $new_commit to origin/$branch"
+                      if ! git push --force origin "$new_commit:refs/heads/$branch"; then
+                        echo "::warning::Failed to push $branch, skipping to next branch."
+                      fi
+
+                      git update-ref -d "refs/remotes/upstream/$branch" 2>/dev/null || true
+                      git reflog expire --expire=now --all || true
+                      git gc --prune=now --all || true
+
+                      echo "::endgroup::"
+                      echo "| $branch | $tip_sha |" >> "$README_FILE"
+                    done
+
+                    {
+                      echo "### Latest single-commit mirror complete"
+                      echo ""
+                      echo "Branches processed: ${#MATCHED_BRANCHES[@]}"
+                      echo ""
+                      echo "Processed branches:"
+                      for branch in "${MATCHED_BRANCHES[@]}"; do
+                        echo "- $branch"
+                      done
+                    } >> "$GITHUB_STEP_SUMMARY"
