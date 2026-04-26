@@ -26,7 +26,7 @@ jobs:
           git config gc.auto 0
 
       - name: Mirror latest commit for all requested branch families
-        shell: bash
+              if [[ -z "${branch_map[$b]+_}" ]]; then
         env:
           SOURCE_REPO: https://android.googlesource.com/kernel/common
           BRANCH_FILTER: ${{ inputs.branch_filter }}
@@ -40,6 +40,13 @@ jobs:
             'refs/heads/android13-5.15*'
             'refs/heads/android14-5.15*'
             'refs/heads/android14-6.1*'
+          # Prepare README.md to store latest commit hashes
+          README_FILE=README.md
+          # Remove old section if present
+          sed -i '/^## Latest branch tips/,/^## /{ /^## Latest branch tips/! { /^## /!d; }; }' "$README_FILE" || true
+          echo -e '\n## Latest branch tips\n' >> "$README_FILE"
+          echo '| Branch | Latest Commit |' >> "$README_FILE"
+          echo '|--------|--------------|' >> "$README_FILE"
             'refs/heads/android15-6.6*'
             'refs/heads/android16-6.12*'
             'refs/heads/deprecated/android12-5.10*'
@@ -71,6 +78,8 @@ jobs:
             exit 1
           fi
 
+            # Write branch and tip_sha as a markdown table row
+            echo "| $branch | $tip_sha |" >> "$README_FILE"
 
           # Deduplicate: if both deprecated/branch and branch exist, keep only deprecated/branch
           declare -A branch_map
